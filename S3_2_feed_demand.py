@@ -8,7 +8,7 @@ input/Land/Feed_pasture/.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 import os
 import logging
@@ -43,6 +43,8 @@ class FeedDemandOutputs:
     crop_feed_demand: pd.DataFrame
     grass_requirement: pd.DataFrame
     species_dm_detail: pd.DataFrame
+    crop_feed_by_livestock: pd.DataFrame = field(default_factory=pd.DataFrame)
+    grass_by_livestock: pd.DataFrame = field(default_factory=pd.DataFrame)
 
 
 def build_feed_demand_from_stock(*,
@@ -104,7 +106,11 @@ def build_feed_demand_from_stock(*,
     years = sorted(set(int(y) for y in years))
     _log_info(f"[S3_2 DEBUG] 请求的years: {years}")
     
-    comm_to_species = {comm: feed_item for feed_item, comm in (maps.feed_item_to_comm or {}).items()}
+    comm_to_species = {}
+    for feed_item, comm in (maps.feed_item_to_comm or {}).items():
+        if comm in comm_to_species and comm_to_species[comm] != feed_item:
+            raise ValueError(f"Multiple feed systems for {comm}; an explicit allocation is required")
+        comm_to_species[comm] = feed_item
     _log_info(f"[S3_2 DEBUG] comm_to_species映射: {len(comm_to_species)} 个commodity")
     if len(comm_to_species) > 0:
         _log_info(f"[S3_2 DEBUG] 映射样例: {list(comm_to_species.items())[:5]}", level=2)
@@ -342,7 +348,8 @@ def build_feed_demand_from_stock(*,
     stock['grass_dm_kg'] = stock['dm_total_kg'] * stock['grass_ratio']
     stock['crop_dm_kg'] = stock['dm_total_kg'] * stock['crop_ratio']
 
-    crop_dm_rows = stock[['country','iso3','m49_code','year','species','dm_total_kg','crop_ratio']].merge(
+    stock['livestock_commodity'] = stock['commodity']
+    crop_dm_rows = stock[['country','iso3','m49_code','year','species','livestock_commodity','dm_total_kg','crop_ratio']].merge(
         crop_share,
         how='left',
         on=['species','m49_code','year']
@@ -363,6 +370,7 @@ def build_feed_demand_from_stock(*,
         crop_dm_rows = crop_dm_rows.dropna(subset=['dm_fraction'])
         crop_dm_rows['commodity'] = crop_dm_rows['crop'].map((maps.production_by_item or {}))
         crop_dm_rows['commodity'] = crop_dm_rows['commodity'].fillna(crop_dm_rows['crop'])
+        crop_dm_rows['feed_commodity'] = crop_dm_rows['commodity']
         crop_dm_rows['grain_need_kg'] = crop_dm_rows['crop_dm_kg'] / crop_dm_rows['dm_fraction']
         crop_dm_rows = crop_dm_rows[crop_dm_rows['commodity'].isin(universe.commodities)]
         crop_dm_rows['feed_t'] = crop_dm_rows['grain_need_kg'] / 1000.0
@@ -435,7 +443,9 @@ def build_feed_demand_from_stock(*,
     return FeedDemandOutputs(
         crop_feed_demand=crop_feed_demand,
         grass_requirement=grass_requirement,
-        species_dm_detail=species_dm_detail
+        species_dm_detail=species_dm_detail,
+        crop_feed_by_livestock=crop_dm_rows.copy(),
+        grass_by_livestock=stock.merge(pasture_yield, how='left', on='m49_code'),
     )
 
 

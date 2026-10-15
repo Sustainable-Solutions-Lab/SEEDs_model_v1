@@ -1968,6 +1968,13 @@ def build_livestock_stock_from_env(csv_path: str, universe: Universe) -> pd.Data
     try:
         maps = load_emis_item_mappings(os.path.join(get_src_base(), 'dict_v3.xlsx'))
         z['commodity'] = z['item_raw'].map(maps.stock_item_to_comm)
+        # B04: some stock rows already use the canonical Item_Emis name
+        # (Swine, Llamas), while Item_Stock_Map contains a different alias.
+        # Preserve those exact canonical matches; never map the parent herd
+        # to both dairy and meat products.
+        canonical_stock_items = set(maps.feed_item_to_comm.values())
+        canonical = z['item_raw'].where(z['item_raw'].isin(canonical_stock_items))
+        z['commodity'] = z['commodity'].fillna(canonical)
         
         # WARNING: keep only commodities that map to dict_v3; drop 'All Animals' and similar
         before_filter = len(z)

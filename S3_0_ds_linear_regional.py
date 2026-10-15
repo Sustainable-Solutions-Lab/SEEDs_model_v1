@@ -1,4 +1,4 @@
-"""
+﻿"""
 Simplified supply-demand equilibrium model: linear elasticities, regional aggregation, full emissions and constraints.
 ================================================================
 
@@ -23,6 +23,9 @@ Objectives:
 """
 
 from __future__ import annotations
+from feed_product_accounts import bounded_feed_credit
+from armington_ces import (attach_ces_sources, update_ces_approximation,
+                           prepare_quantity_projection, recover_projected_ces, ces_value)
 import json
 import copy
 import math
@@ -252,7 +255,7 @@ def _require_positive_yield(
     return y
 
 
-def _require_yield0(
+def _cropland_yield0(
     node_data: Optional[Dict[str, Any]],
     *,
     region: Optional[str] = None,
@@ -265,6 +268,8 @@ def _require_yield0(
             f"Missing node data for yield0 in {context} "
             f"(region={region}, commodity={commodity}, year={year})"
         )
+    if node_data.get('livestock_feed_account', False):
+        return float('inf')
     if 'yield0' not in node_data:
         raise ValueError(
             f"Missing yield0 key in {context} "
@@ -584,6 +589,7 @@ def _compute_luc_emissions_from_solution(
     base_cropland_area: Optional[Dict[str, float]] = None,
     base_grassland_area: Optional[Dict[str, float]] = None,
     luc_shift_area_mode: str = 'abs',
+    feed_background_pasture: Optional[Dict[Tuple[str, int], float]] = None,
 ) -> Tuple[
     Dict[Tuple[str, int], float],
     Dict[Tuple[str, int], float],
@@ -629,7 +635,7 @@ def _compute_luc_emissions_from_solution(
         if j == "Fish, Seafood":
             continue
         node_data = idx.get((r, j, t)) if idx else None
-        yield_j = _require_yield0(
+        yield_j = _cropland_yield0(
             node_data,
             region=r,
             commodity=j,
@@ -660,6 +666,10 @@ def _compute_luc_emissions_from_solution(
             if coef_grass > 0:
                 grass_demand[(r, t)] += coef_grass * qs_raw
 
+    if grassland_method == 'dynamic':
+        for key, area in (feed_background_pasture or {}).items():
+            grass_demand[key] += float(area)
+
     if grassland_method == 'static' and grass_area_by_region_year:
         for key, val in grass_area_by_region_year.items():
             grass_demand[key] = float(val or 0.0)
@@ -674,7 +684,7 @@ def _compute_luc_emissions_from_solution(
         q0_val = float(node_data.get('Q0', 0.0) or 0.0)
         if q0_val <= 0:
             continue
-        yield_j = _require_yield0(
+        yield_j = _cropland_yield0(
             node_data,
             region=r,
             commodity=j,
@@ -700,6 +710,10 @@ def _compute_luc_emissions_from_solution(
         if coef_grass > 0:
             base_grass_demand[r] += coef_grass * q0_val
 
+    if grassland_method == 'dynamic':
+        for (r,t),area in (feed_background_pasture or {}).items():
+            if int(t)==hist_end_year:
+                base_grass_demand[r] += float(area)
     if grassland_method == 'static' and grass_area_by_region_year:
         for (r, t), val in grass_area_by_region_year.items():
             if int(t) == hist_end_year:
@@ -921,7 +935,9 @@ def solve_with_luc_iteration(
     losses_ratio_by: Optional[Dict[Tuple[str, str, int], float]] = None,
     feed_crop_link_mode: Optional[str] = None,
     feed_crop_link_base: Optional[Dict[Tuple[str, str, int], float]] = None,
-    feed_crop_link_coeff: Optional[Dict[Tuple[str, str, int], float]] = None,
+    feed_crop_link_coeff: Optional[Dict[Tuple[str, str, str, int], float]] = None,
+    feed_background_crop: Optional[Dict[Tuple[str, str, int], float]] = None,
+    feed_background_pasture: Optional[Dict[Tuple[str, int], float]] = None,
     feed_crop_link_livestock: Optional[List[str]] = None,
     feed_crop_link_override: Optional[Dict[Tuple[str, str, int], float]] = None,
     feed_crop_link_credit: Optional[Dict[Tuple[str, str, int], float]] = None,
@@ -1072,6 +1088,8 @@ def solve_with_luc_iteration(
             feed_crop_link_mode=feed_crop_link_mode,
             feed_crop_link_base=feed_crop_link_base,
             feed_crop_link_coeff=feed_crop_link_coeff,
+        feed_background_crop=feed_background_crop,
+        feed_background_pasture=feed_background_pasture,
             feed_crop_link_livestock=feed_crop_link_livestock,
             feed_crop_link_override=feed_crop_link_override,
             feed_crop_link_credit=feed_crop_link_credit,
@@ -1104,6 +1122,7 @@ def solve_with_luc_iteration(
             base_grassland_area=result.get('base_grassland_area'),
             luc_params=luc_params,
             luc_shift_area_mode=luc_shift_area_mode,
+            feed_background_pasture=feed_background_pasture,
         )
 
         total_luc = sum(abs(v) for v in emis_crop.values()) + sum(abs(v) for v in emis_pasture.values())
@@ -2888,6 +2907,13 @@ def aggregate_nodes_to_regions(
             # Yield for land constraints
             'yield0': yield0,
             'grassland_coef': grassland_coef,
+                'livestock_feed_account': bool(meta.get('livestock_feed_account', False)),
+                'feed_only_entry': bool(meta.get('feed_only_entry', False)),
+                'livestock_background_only': bool(meta.get('livestock_background_only', False)),
+                'livestock_feed_unidentified': bool(meta.get('livestock_feed_unidentified', False)),
+                'seed_coefficient': float(meta.get('seed_coefficient', 0.0)),
+                'seed_reference_t': float(meta.get('seed_reference_t', 0.0)),
+                'seed_coefficient_unidentified': bool(meta.get('seed_coefficient_unidentified', False)),
             # Supply elasticities
             'eps_supply': getattr(n, 'eps_supply', 0.0) or 0.0,
             'eps_supply_yield': getattr(n, 'eps_supply_yield', 0.0) or 0.0,  # η_y
@@ -2922,6 +2948,12 @@ def aggregate_nodes_to_regions(
         'yield0': lambda x: np.average(x, weights=df.loc[x.index, 'Q0'].clip(lower=1e-6)) if x.sum() > 0 else 0.0,
         # Grassland coefficients: Q0-weighted average, populated only for livestock commodities
         'grassland_coef': lambda x: np.average(x, weights=df.loc[x.index, 'Q0'].clip(lower=1e-6)) if x.sum() > 0 else 0.0,
+        'livestock_feed_account': 'max', 'feed_only_entry': 'max',
+        'livestock_background_only': 'min',
+        'livestock_feed_unidentified': 'min',
+        'seed_coefficient': lambda x: np.average(x, weights=df.loc[x.index, 'Q0'].clip(lower=1e-6)),
+        'seed_reference_t': 'sum',
+        'seed_coefficient_unidentified': 'max',
         # Supply elasticities weighted by Q0
         'eps_supply': lambda x: np.average(x, weights=df.loc[x.index, 'Q0'].clip(lower=1e-6)),
         'eps_supply_yield': lambda x: np.average(x, weights=df.loc[x.index, 'Q0'].clip(lower=1e-6)),
@@ -4186,7 +4218,7 @@ def _write_forest_nonneg_feasibility_diagnosis(
                     yield_check = 0.0
                 if (not np.isfinite(yield_check) or yield_check <= 0.0) and Q0_base_raw <= 1e-3:
                     continue
-                yield_used = _require_yield0(
+                yield_used = _cropland_yield0(
                     data,
                     region=r,
                     commodity=j,
@@ -5199,7 +5231,9 @@ def build_linear_regional_model(
     losses_ratio_by: Optional[Dict[Tuple[str, str, int], float]] = None,
     feed_crop_link_mode: Optional[str] = None,
     feed_crop_link_base: Optional[Dict[Tuple[str, str, int], float]] = None,
-    feed_crop_link_coeff: Optional[Dict[Tuple[str, str, int], float]] = None,
+    feed_crop_link_coeff: Optional[Dict[Tuple[str, str, str, int], float]] = None,
+    feed_background_crop: Optional[Dict[Tuple[str, str, int], float]] = None,
+    feed_background_pasture: Optional[Dict[Tuple[str, int], float]] = None,
     feed_crop_link_livestock: Optional[List[str]] = None,
     feed_crop_link_override: Optional[Dict[Tuple[str, str, int], float]] = None,
     feed_crop_link_credit: Optional[Dict[Tuple[str, str, int], float]] = None,
@@ -5416,6 +5450,13 @@ def build_linear_regional_model(
                 'P0': p0_val,
                 'yield0': yield0,
                 'grassland_coef': grassland_coef,
+                'livestock_feed_account': bool(meta.get('livestock_feed_account', False)),
+                'feed_only_entry': bool(meta.get('feed_only_entry', False)),
+                'livestock_background_only': bool(meta.get('livestock_background_only', False)),
+                'livestock_feed_unidentified': bool(meta.get('livestock_feed_unidentified', False)),
+                'seed_coefficient': float(meta.get('seed_coefficient', 0.0)),
+                'seed_reference_t': float(meta.get('seed_reference_t', 0.0)),
+                'seed_coefficient_unidentified': bool(meta.get('seed_coefficient_unidentified', False)),
                 'eps_supply': getattr(n, 'eps_supply', 0.0) or 0.0,
                 'eps_supply_yield': getattr(n, 'eps_supply_yield', 0.0) or 0.0,
                 'eps_supply_temp': getattr(n, 'eps_supply_temp', 0.0) or 0.0,
@@ -5490,6 +5531,10 @@ def build_linear_regional_model(
                     )
                 )
 
+        feed_required_keys={(str(r),str(c),int(t)) for (r,c,l,t),v in (feed_crop_link_coeff or {}).items() if float(v)>0}
+        feed_required_keys.update((str(r),str(c),int(t)) for (r,c,t),v in (feed_background_crop or {}).items() if float(v)>0)
+        bioenergy_active_keys.update(feed_required_keys)
+        feed_required_pairs={(r,c) for r,c,t in feed_required_keys}
         bioenergy_active_pairs = {
             (region, commodity)
             for region, commodity, _ in bioenergy_active_keys
@@ -5516,6 +5561,7 @@ def build_linear_regional_model(
             filter_mask = pd.Series(
                 [
                     (region, commodity) in tiny_set
+                    and (region, commodity) not in feed_required_pairs
                     and (
                         not np.isfinite(year)
                         or (region, commodity, int(year)) not in bioenergy_active_keys
@@ -6201,48 +6247,45 @@ def build_linear_regional_model(
     if zero_price_shutdown_enabled:
         logger.info("[LINEAR] zero-price shutdown enabled: Pc lower bound 0 rebases future supply curves to Pc=0=>Qs=0")
 
-    livestock_supply_sum: Dict[Tuple[str, int], gp.LinExpr] = {}
-    if feed_link_mode == 'dynamic_constraints' and feed_livestock_set:
-        for (r, j, t), var in Qs.items():
-            if t <= hist_end_year:
-                continue
-            if j not in feed_livestock_set:
-                continue
-            expr = livestock_supply_sum.get((r, t))
-            if expr is None:
-                expr = gp.LinExpr(0.0)
-                livestock_supply_sum[(r, t)] = expr
-            expr += var
-        logger.info(
-            "[LINEAR] feed link livestock sums: %d region-year pairs",
-            len(livestock_supply_sum),
-        )
-    feed_demand_expr_by_key: Dict[Tuple[str, str, int], Any] = {}
-    feed_credit_scaled_by_key: Dict[Tuple[str, str, int], float] = {}
+    feed_demand_expr_by_key = {}
+    feed_credit_scaled_by_key = {}
+    product_feed_index = defaultdict(list)
+    if feed_link_mode == 'dynamic_constraints':
+        for key, coefficient in feed_coeff_map.items():
+            if len(key) != 4:
+                raise ValueError('B04 requires (region, feed crop, livestock product, year) coefficients')
+            r, crop, livestock, t = key
+            if (r, livestock, t) in Qs:
+                product_feed_index[(r,crop,t)].append((float(coefficient), Qs[(r,livestock,t)]))
 
-    def _build_dynamic_feed_expr(region: Any, commodity: Any, year: Any) -> Optional[gp.LinExpr]:
+    if feed_link_mode == 'dynamic_constraints':
+        required=set(product_feed_index)|set(feed_background_crop or {})
+        missing=required-set(Qd)
+        if missing:
+            raise ValueError(f'Positive feed accounts have no market-demand variable: {sorted(missing)[:20]}')
+
+    def _build_dynamic_feed_expr(region, commodity, year):
         if feed_link_mode != 'dynamic_constraints':
             return None
-        feed_coef = _lookup_feed_coef(region, commodity, year)
-        if feed_coef == 0.0:
+        key = (str(region), str(commodity), int(year))
+        if key not in product_feed_index and key not in (feed_background_crop or {}):
             return None
-        try:
-            year_i = int(year)
-        except Exception:
-            year_i = year
-        supply_expr = livestock_supply_sum.get((region, year_i))
-        if supply_expr is None:
-            supply_expr = livestock_supply_sum.get((str(region).strip(), year_i))
-        if supply_expr is None:
-            return None
-        feed_expr = feed_coef * supply_expr
-        if feed_reduction_by:
-            rate = float(feed_reduction_by.get((region, commodity, year_i), 0.0) or 0.0)
-            if rate == 0.0:
-                rate = float(feed_reduction_by.get((str(region).strip(), str(commodity).strip(), year_i), 0.0) or 0.0)
-            rate = max(-1.0, min(1.0, rate))
-            feed_expr = feed_expr * (1.0 + rate)
-        return feed_expr
+        if key not in feed_demand_expr_by_key:
+            terms = product_feed_index.get(key,[])
+            feed_demand_expr_by_key[key] = gp.LinExpr([v for v,_ in terms], [v for _,v in terms])
+            feed_demand_expr_by_key[key] += float((feed_background_crop or {}).get(key,0.)) * inv_qty_scale
+        return feed_demand_expr_by_key[key]
+
+    def _actual_feed_credit(region, commodity, year, gross):
+        key = (str(region), str(commodity), int(year))
+        if key in feed_credit_scaled_by_key:
+            return feed_credit_scaled_by_key[key]
+        potential = _lookup_feed_credit(*key) * inv_qty_scale
+        if potential <= 0 or gross is None:
+            return 0.0
+        credit = bounded_feed_credit(m, gross, potential, name=f'{region},{commodity},{year}')
+        feed_credit_scaled_by_key[key] = credit
+        return credit
 
     world_price_constr: Dict[Tuple[str, int], gp.Constr] = {}
     if use_regional_price:
@@ -6367,7 +6410,7 @@ def build_linear_regional_model(
                         continue
                     feed_headroom_expr += feed_expr
                     feed_headroom_terms += 1
-                if feed_headroom_expr.size() > 0:
+                if feed_headroom_expr.size() > 0 or abs(feed_headroom_expr.getConstant()) > 0:
                     # Dynamic feed is a hard demand term in Qd. The positive import cap must
                     # allow the crop/feed commodity to be sourced for that livestock-driven
                     # demand; otherwise tiny base trade in a feed crop can make BASE infeasible.
@@ -6396,52 +6439,39 @@ def build_linear_regional_model(
                 feed_headroom_terms,
             )
 
+    # B01: physical gross origins, CES quantity and CES purchaser price.
+    # These dictionaries remain empty for the retired trade-deviation penalty.
     armington_slack_pos: Dict[Tuple[str, str, int], gp.Var] = {}
     armington_slack_neg: Dict[Tuple[str, str, int], gp.Var] = {}
     armington_trade_constr: Dict[Tuple[str, str, int], gp.Constr] = {}
+    ces_state = {}
     if use_regional_price:
-        if not armington_sigma_by_comm:
-            logger.warning("[LINEAR] Armington trade enabled but armington_sigma_by_comm is empty")
-        missing_sigma = 0
-        for (r, j, t), ni_var in net_import.items():
-            if t <= hist_end_year:
-                continue
-            base_net = float(trade_base_net_import.get((r, j), 0.0) or 0.0)
-            trade_vol = float(trade_base_volume.get((r, j), abs(base_net)) or 0.0)
-            sigma = _armington_sigma(r, j)
-            if sigma is None:
-                sigma = 0.0
-                missing_sigma += 1
-            base_key = (r, j, hist_end_year)
-            p0_val = idx.get(base_key, {}).get('P0')
-            if p0_val is None:
-                p0_val = idx.get((r, j, t), {}).get('P0', 1.0)
-            p0_val = max(1e-6, float(p0_val or 1.0))
-            trade_vol_scaled = trade_vol * inv_qty_scale
-            base_net_scaled = base_net * inv_qty_scale
-            b_m_abs = trade_vol_scaled * sigma * armington_trade_scale / p0_val
-            b_m = b_m_abs
-            if use_relative_price:
-                ref = float(price_ref_by_comm.get(j, 1.0) or 1.0)
-                if not np.isfinite(ref) or ref <= 0:
-                    ref = 1.0
-                b_m = b_m_abs * ref
-            pw_var = Pw.get((j, t))
-            pc_var = Pc.get((r, j, t))
-            if pw_var is None or pc_var is None:
-                continue
-            sp = m.addVar(lb=0.0, name=f"armington_slack_pos[{r},{j},{t}]")
-            sn = m.addVar(lb=0.0, name=f"armington_slack_neg[{r},{j},{t}]")
-            armington_slack_pos[(r, j, t)] = sp
-            armington_slack_neg[(r, j, t)] = sn
-            armington_trade_constr[(r, j, t)] = m.addConstr(
-                ni_var == base_net_scaled + b_m * (pw_var - pc_var) + sp - sn,
-                name=f"armington_trade[{r},{j},{t}]",
-            )
-        if missing_sigma:
-            logger.warning("[LINEAR] Armington sigma missing for %d region-commodity pairs; using 0.0", missing_sigma)
-        logger.info("[LINEAR] Armington trade constraints added: %d", len(armington_trade_constr))
-    
+        m.update()
+        entry_region_map={}
+        if dict_v3_path:
+            entry_regions=pd.read_excel(dict_v3_path,sheet_name='region',
+                usecols=['M49_Country_Code','Region_market_agg']).dropna().drop_duplicates()
+            entry_region_map=dict(zip(entry_regions.M49_Country_Code.astype(str),entry_regions.Region_market_agg.astype(str)))
+        ces_state = attach_ces_sources(
+            m, external_balance=True, idx=idx, qs=Qs, qd=Qd, net=net_import, pd_vars=Pc, pm_vars=Pw,
+            trade_net=trade_base_net_import, trade_volume=trade_base_volume,
+            sigma_map=armington_sigma_by_comm, base_year=hist_end_year,
+            quantity_scale=qty_scale, price_reference=price_ref_by_comm,
+            relative_price=use_relative_price, bioenergy=bioenergy_crop_demand_map,
+            output_dir=output_dir, entry_region_map=entry_region_map,
+        )
+        for key, source in ces_state['records'].items():
+            if key in nutrition_import_pos:
+                old_split=m.getConstrByName(f'nutrition_trade_split[{key[0]},{key[1]},{key[2]}]')
+                if old_split is not None:
+                    m.remove(old_split)
+                m.addConstr(nutrition_import_pos[key] == source['imports'], name=f"ces_import_cost{key}")
+                m.addConstr(nutrition_export_pos[key] == source['exports'], name=f"ces_export_cost{key}")
+
+    def _consumer_price_var(region, commodity, year):
+        source = ces_state.get('records', {}).get((region, commodity, year))
+        return source['price'] if source is not None else _pc_var(region, commodity, year)
+
     # slack
     excess: Dict[Tuple[str, int], gp.Var] = {}
     shortage: Dict[Tuple[str, int], gp.Var] = {}
@@ -6508,7 +6538,7 @@ def build_linear_regional_model(
             yield_check = float(yield_raw)
         except Exception:
             yield_check = 0.0
-        if (not np.isfinite(yield_check) or yield_check <= 0.0) and q0_for_land <= 1e-3:
+        if (not node_data.get('livestock_feed_account', False)) and (not np.isfinite(yield_check) or yield_check <= 0.0) and q0_for_land <= 1e-3:
             land_expr_missing_yield_skipped += 1
             if len(land_expr_missing_yield_skipped_pairs) < 20:
                 land_expr_missing_yield_skipped_pairs.add((r, j))
@@ -6526,7 +6556,7 @@ def build_linear_regional_model(
                 if len(missing_yield_export_block_samples) < 10:
                     missing_yield_export_block_samples.append((r, j, int(t), q0_for_land, yield_raw))
             continue
-        yield_j = _require_yield0(
+        yield_j = _cropland_yield0(
             node_data,
             region=r,
             commodity=j,
@@ -6560,6 +6590,18 @@ def build_linear_regional_model(
                 # grassland_coef is ha/ton; Qs is scaled by 1/qty_scale and
                 # land expressions are scaled by 1/land_scale.
                 grassland_expr += coef_grass * qty_scale * inv_land_scale * var
+    # B04 background herds have no output denominator. Their physical pasture
+    # remains in the same finite land budget, separately from product Qs.
+    for (r,t), area in (feed_background_pasture or {}).items():
+        if (r,t) not in grassland_expr_by_region_year:
+            grassland_expr_by_region_year[(r,t)] = gp.LinExpr(0.)
+        grassland_expr_by_region_year[(r,t)] += float(area) * inv_land_scale
+    for key,var in Qs.items():
+        if key[2] > hist_end_year and idx[key].get('livestock_background_only',False):
+            m.addConstr(var==0.,name=f'background_herd_no_product[{key[0]},{key[1]},{key[2]}]')
+        if key[2] > hist_end_year and idx[key].get('livestock_feed_unidentified',False):
+            m.addConstr(var==0.,name=f'missing_feed_reference_no_product[{key[0]},{key[1]},{key[2]}]')
+
     if land_expr_missing_yield_skipped:
         logger.info(
             "[LINEAR] missing-yield tiny-base land terms: rows=%d sample_pairs=%s",
@@ -6587,7 +6629,7 @@ def build_linear_regional_model(
             q0_val = float(node_data.get('Q0', 0.0) or 0.0)
             if q0_val <= 0:
                 continue
-            yield_j = _require_yield0(
+            yield_j = _cropland_yield0(
                 node_data,
                 region=r,
                 commodity=j,
@@ -6602,6 +6644,9 @@ def build_linear_regional_model(
             if coef_grass > 0:
                 base_grassland_demand[r] += coef_grass * q0_val
 
+    for (r,t),area in (feed_background_pasture or {}).items():
+        if int(t)==hist_end_year:
+            base_grassland_demand[r] += float(area)
     if grassland_method == 'static' and grass_area_by_region_year:
         for (r, t), val in grass_area_by_region_year.items():
             if int(t) == hist_end_year:
@@ -6786,7 +6831,7 @@ def build_linear_regional_model(
                 q0_val = float(node_data.get('Q0', 0.0) or 0.0)
                 if q0_val <= 0:
                     continue
-                yield_j = _require_yield0(
+                yield_j = _cropland_yield0(
                     node_data,
                     region=r,
                     commodity=j,
@@ -7382,6 +7427,8 @@ def build_linear_regional_model(
         if method in {'nutrition', 'nutrition_band', 'nutrition_anchor'} and j not in nonfood_commodities:
             nut_key = (r, j, t)
             profile_demand = nutrition_demand_map.get(nut_key)
+            if profile_demand is None and data.get('feed_only_entry',False):
+                profile_demand = 0.0  # Explicit feed-only market entry, no imputed human food.
             if profile_demand is None and strict_nutrition:
                 raise ValueError(f"[LINEAR] 营养需求缺失: {nut_key}")
         residual_scaled_for_profile = 0.0
@@ -7403,13 +7450,7 @@ def build_linear_regional_model(
                 profile_scaled = 0.0
                 if j not in nonfood_commodities and profile_demand is not None:
                     profile_scaled = float(profile_demand) * inv_qty_scale
-                feed_credit_scaled = (
-                    _lookup_feed_credit(r, j, t) * inv_qty_scale
-                    if feed_expr_exact is not None
-                    else 0.0
-                )
-                if feed_credit_scaled > 0.0:
-                    feed_credit_scaled_by_key[key] = feed_credit_scaled
+                feed_credit_scaled = _actual_feed_credit(r,j,t,feed_expr_exact)
                 demand_const_scaled = profile_scaled + residual_scaled - feed_credit_scaled
                 if feed_expr_exact is not None:
                     feed_demand_expr_by_key[key] = feed_expr_exact
@@ -7421,7 +7462,7 @@ def build_linear_regional_model(
                     m.addConstr(Qd[key] == demand_const_scaled, name=f"demand_nutrition[{r},{j},{t}]")
                     if bool(zero_demand_production_shutdown) and abs(float(demand_const_scaled)) <= 1e-12:
                         zero_nutrition_demand_keys.add(key)
-                alpha_d_cache[key] = demand_const_scaled
+                alpha_d_cache[key] = profile_scaled + residual_scaled
                 eps_d_cache[key] = 0.0
                 eps_pop_cache[key] = 0.0
                 eps_inc_cache[key] = 0.0
@@ -7474,11 +7515,9 @@ def build_linear_regional_model(
                 upper_expr = upper * inv_qty_scale + residual_scaled_for_band + band_abs_tol_scaled
                 band_feed_expr = _build_dynamic_feed_expr(r, j, t)
                 if band_feed_expr is not None:
-                    feed_credit_scaled = _lookup_feed_credit(r, j, t) * inv_qty_scale
-                    if feed_credit_scaled > 0.0:
-                        feed_credit_scaled_by_key[key] = feed_credit_scaled
-                        lower_expr = lower_expr - feed_credit_scaled
-                        upper_expr = upper_expr - feed_credit_scaled
+                    feed_credit_scaled = _actual_feed_credit(r,j,t,band_feed_expr)
+                    lower_expr = lower_expr - feed_credit_scaled
+                    upper_expr = upper_expr - feed_credit_scaled
                     feed_demand_expr_by_key[key] = band_feed_expr
                     lower_expr = lower_expr + band_feed_expr
                     upper_expr = upper_expr + band_feed_expr
@@ -7527,7 +7566,8 @@ def build_linear_regional_model(
         feed_base_scaled = 0.0
         if feed_link_mode != 'off' and not nutrition_anchor_uses_profile:
             feed_base_scaled = _lookup_feed_base(r, j) * inv_qty_scale
-        D0_nonfeed = max(D0 - feed_base_scaled, 0.0)
+        seed_base_scaled = 0. if nutrition_anchor_uses_profile else float(data.get('seed_reference_t',0.) or 0.) * inv_qty_scale
+        D0_nonfeed = max(D0 - feed_base_scaled - seed_base_scaled, 0.0)
         D0_nonfeed_adjusted = D0_nonfeed * pop_effect * inc_effect
 
         feed_const_scaled = 0.0
@@ -7538,12 +7578,8 @@ def build_linear_regional_model(
         elif feed_link_mode == 'dynamic_constraints':
             feed_expr = _build_dynamic_feed_expr(r, j, t)
             feed_expr_used = feed_expr is not None
-        feed_credit_scaled = 0.0
-        if feed_credit_map and (feed_const_scaled > 0.0 or feed_expr_used):
-            feed_credit_scaled = _lookup_feed_credit(r, j, t) * inv_qty_scale
-            if feed_credit_scaled > 0.0:
-                feed_credit_scaled_by_key[key] = feed_credit_scaled
-        
+        feed_credit_scaled = _actual_feed_credit(r,j,t,feed_expr if feed_expr_used else feed_const_scaled)
+
         # Phase 2: feed intensity change feed_reduction_by
         # For a feed intensity scenario, multiply feed-use commodity demand by (1 + rate).
         # Simplification: apply rate directly to D0_adjusted.
@@ -7611,7 +7647,7 @@ def build_linear_regional_model(
         for other_comm, cross_eps in epsD_row.items():
             if other_comm == j:  # Skip the commodity itself.
                 continue
-            pc_other = _pc_var(r, other_comm, t)
+            pc_other = _consumer_price_var(r, other_comm, t)
             if pc_other is not None:
                 other_base_key = (r, other_comm, hist_end_year)
                 P0_other = idx.get(other_base_key, {}).get('P0')
@@ -7660,7 +7696,7 @@ def build_linear_regional_model(
         
         a_d = a_d - cross_const_offset_d
         a_d_eff = a_d + b_d * price_wedge_self + cross_wedge_shift
-        a_d_total = a_d_eff + feed_const_scaled + residual_scaled_for_profile - feed_credit_scaled
+        a_d_total = a_d_eff + feed_const_scaled + residual_scaled_for_profile
         pmin_j, pmax_j = _price_bounds_for_comm(j)
         # Conservative Pc bounds to keep demand nonnegative (ignore feed_expr).
         pc_bound_key = _pc_key(r, j, t)
@@ -7684,18 +7720,18 @@ def build_linear_regional_model(
                     pc_nonneg_impossible.append((r, j, t, "b_d=0", float(a_d_total + cross_min)))
                 else:
                     pc_nonneg_impossible.append((j, t, "b_d=0", float(a_d_total + cross_min)))
-        pc_self = _pc_var(r, j, t)
+        pc_self = _consumer_price_var(r, j, t)
         if pc_self is None:
             raise ValueError(f"[LINEAR] missing Pc for demand key {r},{j},{t}")
         if feed_expr_used and feed_expr is not None:
             feed_demand_expr_by_key[key] = feed_expr
             cd = m.addConstr(
-                Qd[key] == a_d_total + b_d * pc_self + cross_terms_d + feed_expr,
+                Qd[key] == a_d_total + b_d * pc_self + cross_terms_d + feed_expr - feed_credit_scaled,
                 name=f"demand[{r},{j},{t}]",
             )
         else:
             cd = m.addConstr(
-                Qd[key] == a_d_total + b_d * pc_self + cross_terms_d,
+                Qd[key] == a_d_total + b_d * pc_self + cross_terms_d - feed_credit_scaled,
                 name=f"demand[{r},{j},{t}]",
             )
         constr_demand[key] = cd
@@ -7735,6 +7771,29 @@ def build_linear_regional_model(
         D0_cache[key] = D0
         pop_base_cache[key] = 1.0 if nutrition_anchor_uses_profile else pop_base
         inc_base_cache[key] = 1.0 if nutrition_anchor_uses_profile else inc_base
+
+    # B03: production-linked seed, independent of food and residual adjustments.
+    m.update()
+    seed_demand_expr_by_key = {}
+    for key in future_keys:
+        r, j, t = key
+        row = idx[key]
+        if bool(row.get('seed_coefficient_unidentified', False)):
+            m.addConstr(Qs[key] == 0.0, name=f'seed_missing_coefficient_no_new_production[{r},{j},{t}]')
+        alpha = float(row.get('seed_coefficient', 0.0))
+        if alpha <= 0:
+            continue
+        seed_demand_expr_by_key[key] = alpha * Qs[key]
+        linked = []
+        for prefix in ('demand_nutrition', 'demand_nutrition_lb', 'demand_nutrition_ub', 'demand'):
+            con = m.getConstrByName(f'{prefix}[{r},{j},{t}]')
+            if con is not None:
+                linked.append(con)
+        if key in constr_demand and constr_demand[key] not in linked:
+            linked.append(constr_demand[key])
+        for con in linked:
+            m.chgCoeff(con, Qs[key], m.getCoeff(con, Qs[key]) - alpha)
+    m.update()
 
     zero_demand_shutdown_constr: Dict[Tuple[str, str, int], gp.Constr] = {}
     if zero_nutrition_demand_keys:
@@ -7969,6 +8028,11 @@ def build_linear_regional_model(
                 continue
             region_keys = future_region_keys_by_comm_year.get((j, t), [])
             net_sum = gp.quicksum(net_import[(r, j, t)] for r in region_keys)
+            if ces_state.get('records'):
+                # Gross international flows must close without an external
+                # source/sink represented by the legacy market slack.
+                excess[j,t].UB=0.
+                shortage[j,t].UB=0.
             m.addConstr(
                 net_sum + excess[j, t] - shortage[j, t] == 0,
                 name=f"clear[{j},{t}]"
@@ -9198,7 +9262,7 @@ def build_linear_regional_model(
                             if node_data is None:
                                 continue
                             q0_val = float(node_data.get('Q0', 0.0) or 0.0)
-                            yield_used = _require_yield0(
+                            yield_used = _cropland_yield0(
                                 node_data,
                                 region=r,
                                 commodity=j,
@@ -10157,11 +10221,11 @@ def build_linear_regional_model(
                 yield_check = float(node_data.get('yield0'))
             except Exception:
                 yield_check = 0.0
-            if (not np.isfinite(yield_check) or yield_check <= 0.0) and q0_for_land <= 1e-3:
+            if (not node_data.get('livestock_feed_account', False)) and (not np.isfinite(yield_check) or yield_check <= 0.0) and q0_for_land <= 1e-3:
                 # Already hard-blocked by no_export_missing_land_yield.
                 continue
             try:
-                yield_j = _require_yield0(
+                yield_j = _cropland_yield0(
                     node_data,
                     region=r,
                     commodity=j,
@@ -10318,6 +10382,10 @@ def build_linear_regional_model(
             if grass_pen > 0 and (r, t) in luc_d_grass_pos:
                 cost_stage_obj += cp * grass_pen * land_scale * luc_d_grass_pos[(r, t)]
 
+    if ces_state.get('linearization_slacks'):
+        ces_restoration = gp.quicksum(ces_state['linearization_slacks'])
+        slack_stage_obj += ces_restoration
+        single_stage_obj += 1e14 * qty_scale * ces_restoration
     single_stage_obj += cost_stage_obj
 
     m.setObjective(single_stage_obj, gp.GRB.MINIMIZE)
@@ -10329,6 +10397,7 @@ def build_linear_regional_model(
     m._nzf_cache = {
         # Variables
         'Pc': Pc, 'Pw': Pw, 'Qs': Qs, 'Qd': Qd,
+        'armington_ces': ces_state,
         'supply_curtailment': supply_curtailment,
         'net_import': net_import,
         'nutrition_import_pos': nutrition_import_pos,
@@ -10408,7 +10477,9 @@ def build_linear_regional_model(
         'cross_terms_scale': cross_terms_scale,
         'feed_link_mode': feed_link_mode,
         'feed_link_livestock': sorted(feed_livestock_set),
+        'feed_product_coefficients': dict(feed_coeff_map),
         'feed_demand_expr_by_key': feed_demand_expr_by_key,
+        'seed_demand_expr_by_key': seed_demand_expr_by_key,
         'feed_credit_map': feed_credit_map,
         'feed_credit_scaled_by_key': feed_credit_scaled_by_key,
         'objective_feasibility': slack_stage_obj,
@@ -10635,6 +10706,13 @@ def _predict_excluded_commodities(
                 'P0': p0_val,
                 'yield0': yield0,
                 'grassland_coef': grassland_coef,
+                'livestock_feed_account': bool(meta.get('livestock_feed_account', False)),
+                'feed_only_entry': bool(meta.get('feed_only_entry', False)),
+                'livestock_background_only': bool(meta.get('livestock_background_only', False)),
+                'livestock_feed_unidentified': bool(meta.get('livestock_feed_unidentified', False)),
+                'seed_coefficient': float(meta.get('seed_coefficient', 0.0)),
+                'seed_reference_t': float(meta.get('seed_reference_t', 0.0)),
+                'seed_coefficient_unidentified': bool(meta.get('seed_coefficient_unidentified', False)),
                 'eps_supply': getattr(n, 'eps_supply', 0.0) or 0.0,
                 'eps_supply_yield': getattr(n, 'eps_supply_yield', 0.0) or 0.0,
                 'eps_supply_temp': getattr(n, 'eps_supply_temp', 0.0) or 0.0,
@@ -11069,6 +11147,8 @@ def _optimize_model_with_retries(model: gp.Model,
         return status
 
     logger.info(f"[LINEAR] 开始求解{phase_txt}（无时限）...")
+    cache = getattr(model, '_nzf_cache', {}) or {}
+    projected_ces = prepare_quantity_projection(model, cache)
     model.optimize()
 
     status = int(model.Status)
@@ -11086,6 +11166,34 @@ def _optimize_model_with_retries(model: gp.Model,
             logger.warning(f"[LINEAR] 重新求解失败{phase_txt}: {exc}")
         status = _retry_numeric_status(status)
 
+    if status == gp.GRB.INFEASIBLE:
+        logger.warning('[LINEAR] verify presolved infeasibility using primal simplex with Presolve=0')
+        model.setParam('Presolve',0)
+        model.setParam('Method',0)
+        model.optimize()
+        status = int(model.Status)
+
+    ces_state = (getattr(model, '_nzf_cache', {}) or {}).get('armington_ces', {})
+    if projected_ces and status == gp.GRB.OPTIMAL:
+        residual = recover_projected_ces(ces_state)
+        logger.info('[CES] analytic elimination exact residual=%.6g', residual)
+    if ces_state.get('records') and not projected_ces and status == gp.GRB.OPTIMAL:
+        ces_state['converged'] = False
+        for iteration in range(160):
+            residual = update_ces_approximation(model, ces_state, damping=1.0 if iteration > 3 else 0.5)
+            logger.info('[CES] iteration=%d nonlinear_relative_residual=%.6g', iteration, residual)
+            if ces_state['converged']:
+                break
+            model.optimize()
+            status = _retry_numeric_status(int(model.Status))
+            if status == gp.GRB.INFEASIBLE:
+                logger.warning('[CES] cross-check inner infeasibility with Presolve=0, Method=0')
+                model.setParam('Presolve',0); model.setParam('Method',0)
+                model.optimize(); status=int(model.Status)
+            if status != gp.GRB.OPTIMAL:
+                break
+        if not ces_state['converged']:
+            raise RuntimeError(f'Armington CES did not converge: inner_status={status}, residual={residual}')
     logger.info(f"[LINEAR] 求解完成{phase_txt}，状态={status}")
     return status
 
@@ -11129,7 +11237,7 @@ def _select_land_sources_on_optimal_face(model: gp.Model,
     primary_sense = model.ModelSense
     primary_optimum = float(model.ObjVal)
     scale = float(cache.get('land_scale', 1.0) or 1.0)
-    activity = [(group, key, var, float(var.X)) for group in ('Qs', 'Qd') for key, var in (cache.get(group) or {}).items()]
+    activity = [(group, key, var, float(var.X)) for group in ('Qs', 'Qd', 'Pc', 'Pw') for key, var in (cache.get(group) or {}).items()]
     # Complementary slackness describes the optimal LP face without adding
     # the primary objective (whose penalties can reach 1e12) as a matrix row.
     # Preserve every nonzero reduced-cost variable and every priced inequality.
@@ -11362,7 +11470,7 @@ def _compute_step_land_state(result: Dict[str, Any],
         if t_int == hist_end_year:
             q0_val = float(node_data.get('Q0', 0.0) or 0.0)
             if q0_val > 0:
-                yield_j = _require_yield0(
+                yield_j = _cropland_yield0(
                     node_data,
                     region=r,
                     commodity=j,
@@ -11379,7 +11487,7 @@ def _compute_step_land_state(result: Dict[str, Any],
         qs_val = float(qs.get((r, j, t), 0.0) or 0.0)
         if qs_val <= 0:
             continue
-        yield_j = _require_yield0(
+        yield_j = _cropland_yield0(
             node_data,
             region=r,
             commodity=j,
@@ -11889,7 +11997,9 @@ def solve_linear_regional(
     losses_ratio_by: Optional[Dict[Tuple[str, str, int], float]] = None,
     feed_crop_link_mode: Optional[str] = None,
     feed_crop_link_base: Optional[Dict[Tuple[str, str, int], float]] = None,
-    feed_crop_link_coeff: Optional[Dict[Tuple[str, str, int], float]] = None,
+    feed_crop_link_coeff: Optional[Dict[Tuple[str, str, str, int], float]] = None,
+    feed_background_crop: Optional[Dict[Tuple[str, str, int], float]] = None,
+    feed_background_pasture: Optional[Dict[Tuple[str, int], float]] = None,
     feed_crop_link_livestock: Optional[List[str]] = None,
     feed_crop_link_override: Optional[Dict[Tuple[str, str, int], float]] = None,
     feed_crop_link_credit: Optional[Dict[Tuple[str, str, int], float]] = None,
@@ -12087,6 +12197,8 @@ def solve_linear_regional(
         feed_crop_link_mode=feed_crop_link_mode,
         feed_crop_link_base=feed_crop_link_base,
         feed_crop_link_coeff=feed_crop_link_coeff,
+        feed_background_crop=feed_background_crop,
+        feed_background_pasture=feed_background_pasture,
         feed_crop_link_livestock=feed_crop_link_livestock,
         feed_crop_link_override=feed_crop_link_override,
         feed_crop_link_credit=feed_crop_link_credit,
@@ -12485,6 +12597,44 @@ def solve_linear_regional(
             result['Pc'] = pc_rel
         result['Qs'] = {k: v.X * qty_scale for k, v in cache['Qs'].items()}
         result['Qd'] = {k: v.X * qty_scale for k, v in cache['Qd'].items()}
+        result['seed_demand'] = {k: float(v.getValue()) * qty_scale for k,v in cache.get('seed_demand_expr_by_key',{}).items()}
+        if output_dir and result['seed_demand']:
+            pd.DataFrame([dict(region=k[0],commodity=k[1],year=k[2],seed_t=v)
+                          for k,v in result['seed_demand'].items()]).to_csv(
+                Path(output_dir)/'seed_demand.csv',index=False)
+
+        ces_state = cache.get('armington_ces', {})
+        if ces_state.get('records'):
+            if ces_state.get('method') == 'analytic_price_elimination':
+                recover_projected_ces(ces_state)
+                for key,rec in ces_state['records'].items():
+                    ref=(price_ref.get(key[1],1.) if use_rel else 1.)
+                    result['Pc'][key]=ces_value(rec,'pd')*ref
+                    if use_rel: result['Pc_rel'][key]=ces_value(rec,'pd')
+            result['armington_method'] = ces_state.get('method','sequential_linearization')
+            result['armington_converged'] = bool(ces_state.get('converged'))
+            result['armington_iterations'] = ces_state['history']
+            for label, field in [('domestic_sales', 'domestic'), ('gross_imports','imports'),
+                                 ('gross_exports','exports'), ('ces_composite_quantity','composite')]:
+                result[label] = {key: ces_value(rec,field) * qty_scale for key,rec in ces_state['records'].items()}
+            result['consumer_price'] = {key: ces_value(rec,'price') * (price_ref.get(key[1],1.) if use_rel else 1.)
+                                        for key,rec in ces_state['records'].items()}
+            if output_dir:
+                rows = [dict(region=key[0], commodity=key[1], year=key[2],
+                             physical_demand_t=result['Qd'][key] + rec['bio']*qty_scale,
+                             domestic_sales_t=rec['domestic'].X*qty_scale,
+                             gross_imports_t=rec['imports'].X*qty_scale,
+                             gross_exports_t=rec['exports'].X*qty_scale,
+                             ces_composite_quantity=ces_value(rec,'composite')*qty_scale,
+                             consumer_price=result['consumer_price'][key], reference_status=rec['reference_status'],
+                             domestic_price=ces_value(rec,'pd')*(price_ref.get(key[1],1.) if use_rel else 1.),
+                             import_price=ces_value(rec,'pm')*(price_ref.get(key[1],1.) if use_rel else 1.),
+                             ces_method=ces_state.get('method','sequential_linearization'))
+                        for key,rec in ces_state['records'].items()]
+                pd.DataFrame(rows).to_csv(Path(output_dir)/'Diagnostics'/'armington_sources.csv',index=False)
+                (Path(output_dir)/'Diagnostics'/'armington_iterations.json').write_text(
+                    json.dumps(ces_state['history'],indent=2),encoding='utf-8')
+
         result['bioenergy_crop_demand'] = dict(cache.get('bioenergy_crop_demand_map', {}) or {})
         result['energy_crop_land_requirement'] = _land_dict_out(
             cache.get('energy_crop_land_requirement_map', {}) or {}
@@ -12505,7 +12655,8 @@ def solve_linear_regional(
                     continue
                 if np.isfinite(val) and val > 0.0:
                     feed_result[k] = val * qty_scale
-                    credit_val = float(feed_credit_scaled.get(k, 0.0) or 0.0) * qty_scale
+                    credit_item = feed_credit_scaled.get(k, 0.0)
+                    credit_val = float(credit_item.X if hasattr(credit_item,'X') else credit_item) * qty_scale
                     if credit_val > 0.0:
                         feed_credit_result[k] = credit_val
                         feed_net_result[k] = max(0.0, val * qty_scale - credit_val)
@@ -14525,7 +14676,9 @@ def solve_with_grassland_iteration(
     # feed-crop link
     feed_crop_link_mode: Optional[str] = None,
     feed_crop_link_base: Optional[Dict[Tuple[str, str, int], float]] = None,
-    feed_crop_link_coeff: Optional[Dict[Tuple[str, str, int], float]] = None,
+    feed_crop_link_coeff: Optional[Dict[Tuple[str, str, str, int], float]] = None,
+    feed_background_crop: Optional[Dict[Tuple[str, str, int], float]] = None,
+    feed_background_pasture: Optional[Dict[Tuple[str, int], float]] = None,
     feed_crop_link_livestock: Optional[List[str]] = None,
     feed_crop_link_override: Optional[Dict[Tuple[str, str, int], float]] = None,
     feed_crop_link_credit: Optional[Dict[Tuple[str, str, int], float]] = None,
@@ -14716,6 +14869,8 @@ def solve_with_grassland_iteration(
             feed_crop_link_mode=feed_crop_link_mode,
             feed_crop_link_base=feed_crop_link_base,
             feed_crop_link_coeff=feed_crop_link_coeff,
+        feed_background_crop=feed_background_crop,
+        feed_background_pasture=feed_background_pasture,
             feed_crop_link_livestock=feed_crop_link_livestock,
             feed_crop_link_override=feed_crop_link_override,
             feed_crop_link_credit=feed_crop_link_credit,

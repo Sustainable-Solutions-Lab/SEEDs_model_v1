@@ -38,6 +38,9 @@ from model_run_status import (
 )
 from runtime_data_cache import read_excel_cached, read_csv_cached, read_tabular_cached
 from S1_0_schema import ScenarioConfig, ScenarioData, Node, Universe
+from feed_product_accounts import build_product_coefficients, stock_feed_multipliers
+from livestock_reference import reconcile_livestock_reference
+from seed_demand import calibrate_seed_coefficients, assign_seed_coefficients, load_seed_reference_components
 # configuration (edit here instead of CLI)
 CFG = {
     'run_mode': ' scenario-S30',  # options: 'single' | 'scenario' | 'scenario-<ID>' | 'scenario-[S1, S2, S10]' | 'mc'
@@ -66,7 +69,7 @@ CFG = {
     'nutrition_band_epsilon': 0.05,  # nutrition_band: Qd bounds = (1±epsilon) * profile
     'nutrition_profile': 'historical',  # 'historical'=Nutrition_profile_recalculated_fromD0_food_demand | 'FAO'=Nutrition_profile_rescaled
     'nutrition_profile_sheet': 'low_land_new',  # historical workbook sheet used for Ruminate_Cap profile columns
-    'future_residual_demand_mode': 'base',  # 'base': retain baseline non-food/feed uses; 'population_scaled': scale with population; 'off': omit processing/seed/losses/other residual. losses_ratio adjusts residual_t-seed_t; seed stays fixed.
+    'future_residual_demand_mode': 'base',  # 'base': retain baseline non-food/feed uses; 'population_scaled': scale with population; 'off': omit processing/seed/losses/other residual. losses_ratio adjusts the non-seed residual; seed follows domestic production.
     'residual_base_ratio': 0.8,  # residual_base=(Qd_2020-food_2020-feed_2020)*ratio; 0.9 retains 90% of the baseline residual.
     # Bioenergy demand is disabled by default to preserve all existing runs.
     # When enabled, historical crop feedstock demand is removed from FBS
@@ -5004,6 +5007,7 @@ def _build_feed_override_from_qs(qs_by_country: Dict[Tuple[str, str, int], float
                                  conversion_multiplier: Optional[
                                      Dict[Tuple[str, str, int], float]
                                  ] = None,
+                                 scenario_params: Optional[Dict] = None,
                                  dict_v3_path: str,
                                  log_fn: Optional[Any] = None) -> Dict[Tuple[str, str, int], float]:
     def _log(msg: str) -> None:
@@ -5068,6 +5072,7 @@ def _build_feed_override_from_qs(qs_by_country: Dict[Tuple[str, str, int], float
             hist_manure_stock_path=paths.livestock_patterns_csv,
             dict_v3_path=dict_v3_path,
             universe=universe,
+            scenario_params=scenario_params,
         )
     except Exception as exc:
         _log(f"[FEED-LINK] calculate_stock_from_optimized_production failed: {exc}")
@@ -5077,6 +5082,8 @@ def _build_feed_override_from_qs(qs_by_country: Dict[Tuple[str, str, int], float
         _log("[FEED-LINK] stock_df empty; skip feed override")
         return {}
 
+    if scenario_params is not None:
+        conversion_multiplier = stock_feed_multipliers(scenario_params, universe.countries, universe.commodities, years)
     try:
         feed_outputs = build_feed_demand_from_stock(
             stock_df=stock_df,
@@ -5293,6 +5300,7 @@ def _build_future_residual_demand_map(
     dict_v3_path: str,
     residual_base_ratio: float = 1.0,
     bioenergy_base_by_country_comm: Optional[Dict[Tuple[str, str], float]] = None,
+    reference_audit: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[Tuple[str, str, int], float]:
     mode = _normalize_future_residual_demand_mode(mode)
     if mode == "off":
@@ -5331,6 +5339,10 @@ def _build_future_residual_demand_map(
         dict_v3_path=dict_v3_path,
         elements={"seed"},
     )
+    seed_raw = {}
+    if isinstance(fbs_components_hist, pd.DataFrame) and 'seed_t' in fbs_components_hist:
+        seed_raw = fbs_components_hist.loc[fbs_components_hist['year'].eq(hist_end_year)].groupby(
+            ['country', 'commodity'])['seed_t'].sum().to_dict()
     out: Dict[Tuple[str, str, int], float] = {}
     base_nodes = [n for n in nodes if int(getattr(n, "year", -1) or -1) == int(hist_end_year)]
     for n in base_nodes:
@@ -5354,18 +5366,24 @@ def _build_future_residual_demand_map(
             d0 - max(0.0, food_base) - max(0.0, feed_base) - bioenergy_base,
         )
         residual_base = residual_base_raw * residual_ratio
-        if residual_base <= 1e-9:
-            continue
-
         m49 = _infer_m49_code(country) or _infer_m49_code(getattr(n, "m49", None)) or country
         country_name = universe.country_by_m49.get(m49) or None
         base_seed_share = float(seed_share_lookup.get((m49, commodity), 0.0) or 0.0)
         base_seed_share = max(0.0, min(1.0 - 1e-9, base_seed_share))
-        seed_qty = min(residual_base, d0 * base_seed_share) if base_seed_share > 0 else 0.0
+        # B03: remove unscaled historical seed from the residual exactly once.
+        # The seed coefficient is calibrated separately, before any 0.8 factor.
+        seed_qty = max(0.0, float((getattr(n, 'meta', {}) or {}).get('seed_reference_t',
+            seed_raw.get((country, commodity), d0 * base_seed_share))))
         # losses_ratio / waste_reduction now acts on the whole non-seed residual block:
         # processing + industrial + losses + other uses = residual_t - seed_t.
-        # Seed is kept as a baseline residual demand and is not scaled by losses_ratio.
+        # Dynamic seed is added by the solver as alpha_seed * domestic production.
         adjustable_residual_qty = max(0.0, residual_base - seed_qty)
+        if reference_audit is not None:
+            reference_audit.append(dict(country=country,commodity=commodity,year=hist_end_year,
+                raw_residual_t=residual_base_raw,scaled_residual_t=residual_base,
+                unscaled_seed_t=seed_qty,nonseed_residual_t=adjustable_residual_qty,
+                seed_exceeds_scaled_residual=seed_qty>residual_base+1e-6,
+                seed_excess_t=max(0.,seed_qty-residual_base)))
         adjustable_residual_share = max(0.0, min(1.0 - 1e-9, adjustable_residual_qty / d0)) if d0 > 0 else 0.0
         pop_base = None
         if population_by_country_year:
@@ -5408,7 +5426,7 @@ def _build_future_residual_demand_map(
                     adjustable_qty = adjustable_residual_qty * final_adjustable_share / adjustable_residual_share
                 else:
                     adjustable_qty = d0 * final_adjustable_share
-            residual_future = (seed_qty + max(0.0, adjustable_qty)) * scale
+            residual_future = max(0.0, adjustable_qty) * scale
             if residual_future > 1e-9:
                 out[(country, commodity, year)] = out.get((country, commodity, year), 0.0) + float(residual_future)
     return out
@@ -9732,6 +9750,8 @@ def _clone_feed_demand_outputs(obj: Any, *, deep: bool = True) -> Optional[FeedD
         crop_feed_demand=crop.copy(deep=deep) if deep else crop,
         grass_requirement=grass.copy(deep=deep) if deep else grass,
         species_dm_detail=detail.copy(deep=deep) if deep else detail,
+        crop_feed_by_livestock=(getattr(obj, 'crop_feed_by_livestock', pd.DataFrame()) if not isinstance(obj, dict) else obj.get('crop_feed_by_livestock', pd.DataFrame())).copy(deep=deep),
+        grass_by_livestock=(getattr(obj, 'grass_by_livestock', pd.DataFrame()) if not isinstance(obj, dict) else obj.get('grass_by_livestock', pd.DataFrame())).copy(deep=deep),
     )
 
 
@@ -11482,6 +11502,31 @@ def _run_one_pipeline_impl(paths: DataPaths,
             for comm in universe.commodities
         }
         _log_step(f"[TRADE] trade_cap_exempt_all_pairs=True -> exempt all pairs: {len(trade_cap_exempt_pairs)}")
+    # Every positive livestock feed ingredient needs its own market account,
+    # including countries with no reference food/production observation.
+    required_feed_pairs=set()
+    feed_entry_rows=[]
+    if str(CFG.get('feed_crop_link_mode','off')) != 'off' and feed_outputs is not None:
+        detail=feed_outputs.crop_feed_by_livestock
+        if not detail.empty:
+            required_feed_pairs=set(zip(detail.loc[detail.feed_t.gt(0),'country'].astype(str),
+                detail.loc[detail.feed_t.gt(0),'feed_commodity'].astype(str)))
+    existing_keys={(str(n.country),str(n.commodity),int(n.year)) for n in data.nodes}
+    base_prices={}
+    for n in data.nodes:
+        if int(n.year)==int(cfg.years_hist_end) and float(n.P0)>0:
+            base_prices.setdefault(str(n.commodity),[]).append(float(n.P0))
+    for country,commodity in sorted(required_feed_pairs):
+        for year in [int(cfg.years_hist_end)]+[int(y) for y in active_years if int(y)>int(cfg.years_hist_end)]:
+            if (country,commodity,year) not in existing_keys:
+                data.nodes.append(Node(country,universe.iso3_by_country.get(country,''),year,commodity,
+                    Q0=0.,D0=0.,P0=float(np.median(base_prices.get(commodity,[1.]))),
+                    meta={'feed_only_entry':True,'seed_coefficient_unidentified':True}))
+                feed_entry_rows.append(dict(country=country,commodity=commodity,year=year,action='added_feed_market_account'))
+    for n in data.nodes:
+        if (str(n.country),str(n.commodity)) in required_feed_pairs and float(n.Q0)==0 and float(n.D0)==0:
+            n.meta=n.meta or {};n.meta['feed_only_entry']=True
+    pd.DataFrame(feed_entry_rows,columns=['country','commodity','year','action']).to_csv(outdir/'feed_market_entry_accounts.csv',index=False)
     # Drop country-commodity pairs with zero supply and demand in base year
     if CFG.get('drop_zero_base_nodes', True):
         base_year = int(cfg.years_hist_end or 2020)
@@ -11493,6 +11538,8 @@ def _run_one_pipeline_impl(paths: DataPaths,
             q0 = float(getattr(n, 'Q0', 0.0) or 0.0)
             d0 = float(getattr(n, 'D0', 0.0) or 0.0)
             if abs(q0) <= zero_tol and abs(d0) <= zero_tol:
+                if (str(n.country),str(n.commodity)) in required_feed_pairs:
+                    continue
                 if trade_cap_exempt_pairs and (n.country, n.commodity) in trade_cap_exempt_pairs:
                     continue
                 zero_keys.add((n.country, n.commodity))
@@ -11612,6 +11659,21 @@ def _run_one_pipeline_impl(paths: DataPaths,
         _log_step(f"基准年缺失需求已用本国供应回填：{restored_demand} 个节点")
     _log_step("\u5df2\u5e94\u7528 FBS \u9700\u6c42\u62c6\u5206\uff0c\u5df2\u6839\u636e\u8d38\u6613\u6570\u636e\u66f4\u65b0\u57fa\u51c6\u9700\u6c42")
 
+    # B03: unscaled FBS seeds and domestic production share the model commodity
+    # mapping. Keep a complete calibration ledger, including unidentified ratios.
+    seed_shares = _build_component_share_lookup_from_demand_composition(
+        universe=universe, maps=item_maps, dict_v3_path=str(paths.dict_v3_path), elements={"seed"})
+    seed_fallback = {(str(n.country), str(n.commodity)): float(n.D0) * seed_shares.get(
+        (_infer_m49_code(n.country) or str(n.country), str(n.commodity)), float('nan'))
+        for n in data.nodes if int(n.year)==int(cfg.years_hist_end)}
+    seed_reference_components = load_seed_reference_components(paths, universe)
+    seed_calibration = calibrate_seed_coefficients(data.nodes, seed_reference_components,
+        base_year=int(cfg.years_hist_end),
+        crop_commodities={j for j in universe.commodities if universe.item_cat2_by_commodity.get(j)=='Crop'},
+        fallback_seed=seed_fallback)
+    assign_seed_coefficients(data.nodes, seed_calibration)
+    seed_calibration.to_csv(outdir / 'seed_reference_coefficients.csv', index=False, encoding='utf-8-sig')
+
     feed_link_mode = _normalize_feed_link_mode(CFG.get('feed_crop_link_mode'))
     feed_link_base_map: Dict[Tuple[str, str, int], float] = {}
     feed_link_base_map_country: Dict[Tuple[str, str, int], float] = {}
@@ -11625,50 +11687,12 @@ def _run_one_pipeline_impl(paths: DataPaths,
             feed_link_base_map = _build_feed_base_from_fbs(fbs_comp, cfg.feed_efficiency)
         feed_link_base_map_country = dict(feed_link_base_map)
         feed_link_livestock = sorted({str(v) for v in (item_maps.feed_item_to_comm or {}).values() if v})
-        livestock_prod_map = _build_livestock_total_production(
-            production_df,
-            feed_link_livestock,
-            [int(cfg.years_hist_end)],
-        )
         if use_regional:
-            feed_link_base_map = _aggregate_country_comm_year_dict(
-                feed_link_base_map,
-                use_regional=True,
-                dict_v3_path=str(paths.dict_v3_path),
-            )
-            livestock_prod_map = _aggregate_country_year_dict(
-                livestock_prod_map,
-                use_regional=True,
-                dict_v3_path=str(paths.dict_v3_path),
-            )
-        feed_link_coef_map = _build_feed_coefficients(
-            feed_link_base_map,
-            livestock_prod_map,
-            base_year=int(cfg.years_hist_end),
-            years=active_years,
-        )
-        feed_link_coef_map_base = dict(feed_link_coef_map)
-        feed_efficiency_by_region_year = _build_feed_efficiency_multiplier_by_region_year(
-            production_df,
-            feed_link_livestock,
-            scenario_ctx.get('dm_conversion_multiplier', {}),
-            base_year=int(cfg.years_hist_end),
-            years=active_years,
-            use_regional=use_regional,
-            dict_v3_path=str(paths.dict_v3_path),
-        )
-        if feed_efficiency_by_region_year:
-            feed_link_coef_map = {
-                key: float(value)
-                * float(feed_efficiency_by_region_year.get((str(key[0]), int(key[2])), 1.0))
-                for key, value in feed_link_coef_map_base.items()
-            }
-        _log_step(
-            f"[FEED-LINK] mode={feed_link_mode} crop_category={feed_crop_category} "
-            f"base={len(feed_link_base_map)} "
-            f"coef={len(feed_link_coef_map)} livestock={len(feed_link_livestock)} "
-            f"efficiency_region_year={len(feed_efficiency_by_region_year)}"
-        )
+            feed_link_base_map = _aggregate_country_comm_year_dict(feed_link_base_map,
+                use_regional=True, dict_v3_path=str(paths.dict_v3_path))
+        # Keep the untouched 2020 product account for subsequent scenario factors.
+        feed_reference_outputs = feed_outputs
+        _log_step(f"[B04] product feed linkage: {len(feed_link_livestock)} livestock products")
 
     # Apply base-year world prices to Node.P0 (anchor for linearized price changes)
     cached_price_map = run_cache.get('base_price_map')
@@ -11958,28 +11982,8 @@ def _run_one_pipeline_impl(paths: DataPaths,
                     in feed_conversion_multiplier.items()
                 ]
             )
-            efficiency_by_region_year = _build_feed_efficiency_multiplier_by_region_year(
-                production_df,
-                feed_link_livestock,
-                feed_conversion_multiplier,
-                base_year=int(cfg.years_hist_end),
-                years=active_years,
-                use_regional=use_regional,
-                dict_v3_path=str(paths.dict_v3_path),
-            )
-            if feed_link_coef_map_base and efficiency_by_region_year:
-                feed_link_coef_map = {
-                    key: float(value)
-                    * float(efficiency_by_region_year.get((str(key[0]), int(key[2])), 1.0))
-                    for key, value in feed_link_coef_map_base.items()
-                }
-            _log_step(
-                "[FEED-EFFICIENCY] rebuilt solver feed inputs: "
-                f"multiplier_keys={len(feed_conversion_multiplier)}, "
-                f"crop_feed_rows={len(feed_override_df)}, "
-                f"region_year_multipliers={len(efficiency_by_region_year)}"
-            )
-        
+            _log_step(f"[B04] scenario intake multipliers: {len(feed_conversion_multiplier)}")
+
         _log_step("="*80)
     elif scenario_params and 'ruminant_intake_cap' in scenario_params:
         # For legacy scenario_params inputs, check and repair ruminant_intake_cap.
@@ -12210,26 +12214,101 @@ def _run_one_pipeline_impl(paths: DataPaths,
     except Exception as e:
         _log_step(f"[YIELD] target-year yield assignment failed; fallback to node yield0: {e}")
     
-    # 4.2) Calculate and assign livestock grassland coefficients (ha/tonne).
-    try:
-        assign_grassland_coef_to_nodes(
-            nodes=data.nodes,
-            paths=paths,
-            universe=universe,
-            maps=item_maps,
-            stock_df=data.gle_livestock_stock_df,
-            livestock_yield_df=livestock_yield_df,
-            yield_multiplier=(scenario_ctx.get('yield_multiplier', {}) if isinstance(scenario_ctx, dict) else None),
-            dm_conversion_multiplier=(scenario_ctx.get('dm_conversion_multiplier', {}) if isinstance(scenario_ctx, dict) else None),
-            feed_requirement_scheme=CFG.get('feed_requirement_scheme'),
-            use_regional_aggregation=use_regional,
-            verbose=bool(CFG.get('grassland_coef_verbose_logging', False)),
-        )
-    except Exception as e:
-        _log_step(f" 分配grassland系数失败: {e}")
-        import traceback
-        traceback.print_exc()
-    
+    # B04: the very same per-product reference generates crop feed and pasture.
+    if feed_link_mode != 'off':
+        if feed_crop_category != 'gleam':
+            raise ValueError('B04 product-resolved linkage requires GLEAM product feed accounts')
+        region_map = ({c: get_region(c, dict_v3_path=str(paths.dict_v3_path))
+                       for c in universe.countries} if use_regional else None)
+        ratio_reference, stock_reference_audit = reconcile_livestock_reference(
+            production_df, stock_hist_df, paths=paths, universe=universe,
+            base_year=int(cfg.years_hist_end))
+        missing_observed_stock=stock_reference_audit.loc[
+            stock_reference_audit.stock_reference_source.eq('existing_animal_stock_converter_missing_observation')].copy()
+        if not missing_observed_stock.empty:
+            supplement=pd.DataFrame(dict(country=missing_observed_stock.M49_Country_Code,
+                M49_Country_Code=missing_observed_stock.M49_Country_Code,
+                commodity=missing_observed_stock.Item_Emis,stock_head=missing_observed_stock.stock_head,
+                year=int(cfg.years_hist_end)))
+            supplement['iso3']=supplement.country.map(universe.iso3_by_country).fillna('')
+            supplementary_feed=build_feed_demand_from_stock(stock_df=supplement,universe=universe,
+                maps=item_maps,paths=paths,years=[int(cfg.years_hist_end)],conversion_multiplier={},
+                feed_requirement_scheme=CFG.get('feed_requirement_scheme'))
+            supplementary_feed.crop_feed_by_livestock.to_csv(outdir/'estimated_missing_stock_crop_feed_reference.csv',index=False)
+            supplementary_feed.grass_by_livestock.to_csv(outdir/'estimated_missing_stock_dm_reference.csv',index=False)
+            feed_reference_outputs.crop_feed_by_livestock=pd.concat([
+                feed_reference_outputs.crop_feed_by_livestock,supplementary_feed.crop_feed_by_livestock],ignore_index=True)
+            feed_reference_outputs.grass_by_livestock=pd.concat([
+                feed_reference_outputs.grass_by_livestock,supplementary_feed.grass_by_livestock],ignore_index=True)
+        missing_observed_stock.to_csv(outdir/'estimated_missing_stock_reference.csv',index=False)
+        feed_background = {}
+        feed_link_coef_map, product_pasture, product_feed_audit = build_product_coefficients(
+            feed_reference_outputs.crop_feed_by_livestock,
+            feed_reference_outputs.grass_by_livestock, production_df,
+            base_year=int(cfg.years_hist_end), years=active_years,
+            intake_multiplier=scenario_ctx.get('dm_conversion_multiplier', {}),
+            yield_multiplier=scenario_ctx.get('yield_multiplier', {}),
+            multiplier_basis=scenario_ctx.get('feed_multiplier_basis', 'per_head'),
+            region_by_country=region_map, feed_efficiency=cfg.feed_efficiency, background=feed_background)
+        # Include any additional ingredient accounts introduced by the ten
+        # explicitly estimated missing-stock references as well.
+        detailed_pairs=set(zip(product_feed_audit.country.astype(str),product_feed_audit.feed_commodity.astype(str)))
+        late_pairs=detailed_pairs-required_feed_pairs
+        existing={(str(n.country),str(n.commodity),int(n.year)) for n in data.nodes}
+        for country,commodity in sorted(late_pairs):
+            for year in [int(cfg.years_hist_end)]+[int(y) for y in active_years if int(y)>int(cfg.years_hist_end)]:
+                if (country,commodity,year) not in existing:
+                    data.nodes.append(Node(country,universe.iso3_by_country.get(country,''),year,commodity,
+                        Q0=0.,D0=0.,P0=float(np.median(base_prices.get(commodity,[1.]))),
+                        meta={'feed_only_entry':True,'seed_coefficient_unidentified':True}))
+                    feed_entry_rows.append(dict(country=country,commodity=commodity,year=year,action='added_estimated_stock_feed_market'))
+        required_feed_pairs.update(detailed_pairs)
+        pd.DataFrame(feed_entry_rows,columns=['country','commodity','year','action']).to_csv(outdir/'feed_market_entry_accounts.csv',index=False)
+        product_feed_audit.to_csv(outdir / 'feed_product_reference.csv', index=False)
+        feed_background['reference_totals'].to_csv(outdir / 'feed_dm_reference_by_livestock.csv',index=False)
+        pd.DataFrame([dict(region=r,feed_commodity=c,year=t,feed_t=v)
+                      for (r,c,t),v in feed_background['crop'].items()]).to_csv(outdir/'background_herd_crop_feed.csv',index=False)
+        pd.DataFrame([dict(country=c,livestock_commodity=l,year=t,total_dm_t=v)
+                      for (c,l,t),v in feed_background['dm'].items()]).to_csv(outdir/'background_herd_dm.csv',index=False)
+        totals=feed_background['reference_totals']
+        background_dm=totals.loc[totals.background_herd,'dm_total_kg'].sum()
+        total_dm=totals.dm_total_kg.sum()
+        bg_crop=product_feed_audit.loc[product_feed_audit.status.eq('background_herd'),'feed_t'].sum()
+        crop_total=product_feed_audit.feed_t.sum()
+        pd.DataFrame([dict(year=int(cfg.years_hist_end),background_total_dm_t=background_dm/1000.,
+            all_herd_total_dm_t=total_dm/1000.,background_total_dm_share=background_dm/total_dm if total_dm>0 else 0.,
+            background_crop_feed_t=bg_crop,all_herd_crop_feed_t=crop_total,
+            background_crop_feed_share=bg_crop/crop_total if crop_total>0 else 0.)]).to_csv(
+                outdir/'background_herd_feed_share.csv',index=False)
+        scenario_ctx['background_stock_reference'] = dict(feed_background['stock'])
+
+        pd.DataFrame([dict(region=r,feed_commodity=c,livestock_commodity=l,year=t,coefficient=v)
+                      for (r,c,l,t),v in feed_link_coef_map.items()]).to_csv(
+                          outdir / 'feed_product_coefficients.csv', index=False)
+        feed_reference_keys=set(zip(totals.country.astype(str),totals.livestock_commodity.astype(str)))
+        missing_feed_reference=[]
+        for node in data.nodes:
+            if str(node.commodity) in feed_link_livestock:
+                node.meta = node.meta or {}
+                node.meta['livestock_feed_account'] = True
+                missing_reference=(str(node.country),str(node.commodity)) not in feed_reference_keys
+                node.meta['livestock_feed_unidentified']=missing_reference
+                if missing_reference and int(node.year)==int(cfg.years_hist_end) and float(node.Q0)>0:
+                    missing_feed_reference.append(dict(country=str(node.country),commodity=str(node.commodity),
+                        production_t=float(node.Q0),status='missing_stock_feed_reference_future_production_disabled'))
+                node.meta['livestock_background_only'] = (str(node.country),str(node.commodity)) in feed_background['stock']
+                r = (region_map or {}).get(str(node.country), str(node.country))
+                node.meta['grassland_coef'] = product_pasture.get((r,str(node.commodity),int(node.year)),0.)
+        pd.DataFrame(missing_feed_reference).to_csv(outdir/'livestock_missing_feed_reference.csv',index=False)
+
+        scenario_ctx['stock_ratio_reference'] = ratio_reference
+        scenario_ctx['animal_yield_reference'] = {
+            (str(row.M49_Country_Code), str(row.Item_Emis)): float(row.yield_per_animal_reference)
+            for row in stock_reference_audit.loc[
+                stock_reference_audit.status.eq('reconciled_preserve_production_stock_feed')].itertuples(index=False)
+        }
+        stock_reference_audit.to_csv(outdir / 'livestock_stock_reference.csv', index=False)
+
     _log_step("\u5df2\u6784\u5efa\u751f\u4ea7/\u571f\u5730/\u80a5\u6599\u7b49\u6d3b\u52a8\u6570\u636e")
     # 5) Apply scenario parameters to data (feed reduction, ruminant cap, land carbon price, yield, etc.)
     scen = scenario_ctx
@@ -12372,6 +12451,9 @@ def _run_one_pipeline_impl(paths: DataPaths,
                     d0 = float(prev_d[1])
                     n.D0 = d0
             if q0 <= 0.0 and d0 <= 0.0:
+                if (str(n.country),str(n.commodity)) in required_feed_pairs:
+                    adjusted_nodes.append(n)
+                    continue
                 dropped_future += 1
                 continue
             if q0 <= 0.0:
@@ -13244,9 +13326,26 @@ def _run_one_pipeline_impl(paths: DataPaths,
                     f"trade_exempt_added={profile_node_stats.get('trade_exempt_added', 0)}"
                     + (f" sample={sample_txt}" if sample_txt else "")
                 )
+        # Nutrition profile preparation can add market nodes after B03/B04
+        # calibration. Those nodes must inherit the same reference restrictions;
+        # otherwise a zero-output background herd could become a free producer.
+        assign_seed_coefficients(data.nodes,seed_calibration)
+        calibrated_seed_pairs=set(zip(seed_calibration.country.astype(str),seed_calibration.commodity.astype(str)))
+        for node in data.nodes:
+            node.meta=node.meta or {}
+            pair=(str(node.country),str(node.commodity))
+            if universe.item_cat2_by_commodity.get(str(node.commodity))=='Crop' and pair not in calibrated_seed_pairs:
+                node.meta['seed_coefficient_unidentified']=True
+            if feed_link_mode!='off' and str(node.commodity) in feed_link_livestock:
+                node.meta['livestock_feed_account']=True
+                node.meta['livestock_feed_unidentified']=pair not in feed_reference_keys
+                node.meta['livestock_background_only']=pair in feed_background['stock']
+                r=(region_map or {}).get(pair[0],pair[0])
+                node.meta['grassland_coef']=product_pasture.get((r,pair[1],int(node.year)),0.)
         future_residual_mode = _normalize_future_residual_demand_mode(
             CFG.get('future_residual_demand_mode', 'base')
         )
+        seed_residual_audit=[]
         nutrition_residual_demand_map_country = _build_future_residual_demand_map(
             data.nodes,
             fbs_comp_hist,
@@ -13260,12 +13359,14 @@ def _run_one_pipeline_impl(paths: DataPaths,
             waste_reduction_by=scenario_ctx.get('waste_reduction_rate_by', {}) if scenario_ctx else {},
             dict_v3_path=str(paths.dict_v3_path),
             residual_base_ratio=CFG.get('residual_base_ratio', 1.0),
+            reference_audit=seed_residual_audit,
             bioenergy_base_by_country_comm=(
                 bioenergy_bundle.historical_crop_base_by_country_comm
                 if bioenergy_enabled
                 else None
             ),
         )
+        pd.DataFrame(seed_residual_audit).to_csv(outdir/'seed_nonseed_reference_audit.csv',index=False)
         residual_exclude_commodities = {str(c).strip() for c in (CFG.get('exclude_commodities') or []) if str(c).strip()}
         if residual_exclude_commodities and nutrition_residual_demand_map_country:
             before_n = len(nutrition_residual_demand_map_country)
@@ -15017,6 +15118,8 @@ def _run_one_pipeline_impl(paths: DataPaths,
                     feed_crop_link_mode=feed_mode,
                     feed_crop_link_base=feed_base,
                     feed_crop_link_coeff=feed_coef,
+                    feed_background_crop=(feed_background['crop'] if feed_link_mode=='dynamic_constraints' else None),
+                    feed_background_pasture=(feed_background['pasture'] if feed_link_mode!='off' else None),
                     feed_crop_link_livestock=feed_livestock,
                     feed_crop_link_override=feed_override,
                     feed_crop_link_credit=feed_credit,
@@ -15153,6 +15256,8 @@ def _run_one_pipeline_impl(paths: DataPaths,
                     feed_crop_link_mode=feed_mode,
                     feed_crop_link_base=feed_base,
                     feed_crop_link_coeff=feed_coef,
+                    feed_background_crop=(feed_background['crop'] if feed_link_mode=='dynamic_constraints' else None),
+                    feed_background_pasture=(feed_background['pasture'] if feed_link_mode!='off' else None),
                     feed_crop_link_livestock=feed_livestock,
                     feed_crop_link_override=feed_override,
                     feed_crop_link_credit=feed_credit,
@@ -15291,6 +15396,8 @@ def _run_one_pipeline_impl(paths: DataPaths,
                 feed_crop_link_mode=feed_mode,
                 feed_crop_link_base=feed_base,
                 feed_crop_link_coeff=feed_coef,
+                    feed_background_crop=(feed_background['crop'] if feed_link_mode=='dynamic_constraints' else None),
+                    feed_background_pasture=(feed_background['pasture'] if feed_link_mode!='off' else None),
                 feed_crop_link_livestock=feed_livestock,
                 feed_crop_link_override=feed_override,
                 feed_crop_link_credit=feed_credit,
@@ -15385,6 +15492,7 @@ def _run_one_pipeline_impl(paths: DataPaths,
                     conversion_multiplier=scenario_ctx.get(
                         'dm_conversion_multiplier', {}
                     ),
+                    scenario_params=scenario_ctx,
                     dict_v3_path=str(paths.dict_v3_path),
                     log_fn=_log_step,
                 )
@@ -15440,6 +15548,70 @@ def _run_one_pipeline_impl(paths: DataPaths,
             
             # Apply results to nodes, setting n.P, n.Q, and n.D.
             apply_results_to_nodes(data.nodes, country_result)
+
+            # Seed remains an 'other use' in reporting, but was removed from the
+            # fixed residual before optimization. Add the solved seed exactly
+            # once here so it cannot be reported as human food/calories.
+            country_seed={}
+            for node in data.nodes:
+                key=(str(node.country),str(node.commodity),int(node.year))
+                if key[2] <= int(cfg.years_hist_end):
+                    continue
+                coefficient=float((node.meta or {}).get('seed_coefficient',0.))
+                if coefficient>0:
+                    country_seed[key]=coefficient*float(country_result.get('Qs',{}).get(key,0.))
+            country_result['seed_demand']=country_seed
+            residual_with_seed=dict(nutrition_residual_demand_map_country or {})
+            for key,value in country_seed.items():
+                residual_with_seed[key]=residual_with_seed.get(key,0.)+value
+            residual_demand_df=_demand_map_to_df(residual_with_seed,universe=universe,value_col='residual_t')
+            _demand_map_to_df(country_seed,universe=universe,value_col='seed_t').to_csv(
+                outdir/'seed_demand_country_result.csv',index=False)
+
+            if feed_link_mode != 'off':
+                # Report background shares using total DM before crop/grass split.
+                from feed_product_accounts import parameter_value, intensity_multiplier
+                dm_rows=[]
+                for row in feed_background['reference_totals'].itertuples(index=False):
+                    for year in active_years:
+                        if int(year)<=int(cfg.years_hist_end):
+                            continue
+                        key=(str(row.country),str(row.livestock_commodity),int(year))
+                        intake=parameter_value(scenario_ctx.get('dm_conversion_multiplier',{}),*key)
+                        productivity=parameter_value(scenario_ctx.get('yield_multiplier',{}),*key)
+                        if row.background_herd:
+                            mult=intake if scenario_ctx.get('feed_multiplier_basis','per_head')=='per_head' else 1.
+                            amount=row.dm_total_kg/1000.*mult/cfg.feed_efficiency
+                        else:
+                            mult=intensity_multiplier(intake,productivity,basis=scenario_ctx.get('feed_multiplier_basis','per_head'))
+                            amount=row.dm_total_kg/1000./row.production_t*float(country_result.get('Qs',{}).get(key,0.))*mult/cfg.feed_efficiency
+                        dm_rows.append(dict(country=key[0],livestock_commodity=key[1],year=key[2],
+                                            total_dm_t=amount,background_herd=bool(row.background_herd)))
+                dm_result=pd.DataFrame(dm_rows)
+                dm_result.to_csv(outdir/'feed_dm_by_livestock_result.csv',index=False)
+                feed_flow_rows=[]
+                solved_supply=linear_result.get('Qs',{})
+                for (r,c,l,t),coefficient in feed_link_coef_map.items():
+                    output=float(solved_supply.get((r,l,t),0.))
+                    feed_flow_rows.append(dict(region=r,feed_commodity=c,livestock_commodity=l,
+                        year=t,production_t=output,feed_coefficient=coefficient,feed_t=coefficient*output,
+                        background_herd=False))
+                for (r,c,t),amount in feed_background['crop'].items():
+                    feed_flow_rows.append(dict(region=r,feed_commodity=c,livestock_commodity='BACKGROUND_TOTAL',
+                        year=t,production_t=0.,feed_coefficient=np.nan,feed_t=amount,background_herd=True))
+                pd.DataFrame(feed_flow_rows).to_csv(outdir/'feed_crop_by_livestock_result.csv',index=False)
+
+                share_rows=[]
+                for year,group in dm_result.groupby('year'):
+                    total=float(group.total_dm_t.sum());bg=float(group.loc[group.background_herd,'total_dm_t'].sum())
+                    crop_total=sum(float(v) for (r,c,t),v in country_result.get('feed_demand',{}).items() if t==year)
+                    crop_bg=sum(float(v) for (r,c,t),v in feed_background['crop'].items() if t==year)
+                    share_rows.append(dict(year=year,background_total_dm_t=bg,all_herd_total_dm_t=total,
+                        background_total_dm_share=bg/total if total>0 else 0.,background_crop_feed_t=crop_bg,
+                        all_herd_crop_feed_t=crop_total,background_crop_feed_share=crop_bg/crop_total if crop_total>0 else 0.))
+                baseline_share=pd.read_csv(outdir/'background_herd_feed_share.csv')
+                pd.concat([baseline_share,pd.DataFrame(share_rows)],ignore_index=True).to_csv(
+                    outdir/'background_herd_feed_share.csv',index=False)
 
             if feed_link_mode == 'dynamic_constraints' and country_result.get('feed_demand'):
                 dynamic_feed_df = _demand_map_to_df(
@@ -16600,7 +16772,7 @@ def _run_one_pipeline_impl(paths: DataPaths,
                                             maps=item_maps,
                                             paths=paths,
                                             years=active_years,
-                                            conversion_multiplier=scenario_ctx.get('dm_conversion_multiplier', {}),
+                                            conversion_multiplier=stock_feed_multipliers(scenario_ctx, universe.countries, universe.commodities, active_years, base_year=int(cfg.years_hist_end), feed_efficiency=cfg.feed_efficiency),
                                             feed_requirement_scheme=CFG.get('feed_requirement_scheme'),
                                         )
                                         # Check build_feed_demand results.
@@ -16750,6 +16922,19 @@ def _run_one_pipeline_impl(paths: DataPaths,
                                                 'commodity': commodity,
                                                 'grass_area_need_ha': grass_coef * qs_val,
                                             })
+                                    # B04: Qs-linked rows exclude independent zero-output
+                                    # herds. Include their pasture once in the same
+                                    # baseline/future series used for LUC and reporting.
+                                    for (country_key, year), area in feed_background['pasture'].items():
+                                        if int(year) < base_year:
+                                            continue
+                                        country_name, m49_code = _resolve_country_and_m49(country_key, universe)
+                                        if not m49_code:
+                                            raise ValueError(f'Unmapped background pasture country {country_key}')
+                                        grass_rows.append({'M49_Country_Code':m49_code,
+                                            'country':country_name,'iso3':universe.iso3_by_country.get(country_name,''),
+                                            'year':int(year),'commodity':'background_herd',
+                                            'grass_area_need_ha':float(area)})
                                     if grass_rows:
                                         grass_qs_df = pd.DataFrame(grass_rows)
                                         grass_qs_df = (
@@ -21929,6 +22114,13 @@ def _run_one_pipeline_impl(paths: DataPaths,
         # Sort by country, year, and commodity to inspect duplicates.
         if 'M49_Country_Code' in market_sum.columns:
             market_sum = market_sum.sort_values(['M49_Country_Code', 'year', 'commodity']).reset_index(drop=True)
+        if not use_regional and isinstance(linear_result,dict) and linear_result.get('armington_converged'):
+            keys=list(zip(market_sum.M49_Country_Code.astype(str),market_sum.commodity.astype(str),market_sum.year.astype(int)))
+            for field in ['domestic_sales','gross_imports','gross_exports','ces_composite_quantity','consumer_price']:
+                values=linear_result.get(field,{})
+                market_sum[field]=[values.get(key,np.nan) for key in keys]
+            market_sum['seed_t']=[country_result.get('seed_demand',{}).get(key,0.) if key[2]>int(cfg.years_hist_end) else np.nan
+                                  for key in keys]
         market_sum.to_csv(os.path.join(ds_dir_str, "market_summary.csv"), index=False, encoding='utf-8-sig')
     if isinstance(linear_result, dict):
         pc_map = linear_result.get('Pc') or {}

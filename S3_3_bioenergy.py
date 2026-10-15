@@ -2071,12 +2071,19 @@ def _energy_crop_land_requirement_map(land_handoff: pd.DataFrame) -> Dict[Tuple[
         return {}
     work = land_handoff.copy()
     work["year"] = pd.to_numeric(work.get("year"), errors="coerce")
-    value_col = (
-        "feasible_additional_land_expansion_ha"
-        if "feasible_additional_land_expansion_ha" in work.columns
-        else ("feasible_land_requirement_ha" if "feasible_land_requirement_ha" in work.columns else "land_requirement_ha")
-    )
+    # B02: reallocated existing cropland occupies the same finite budget as
+    # expansion. The handoff already excludes conventional agricultural crops.
+    value_col = "feasible_land_requirement_ha"
+    if value_col not in work.columns:
+        if {"activity_tdm", "yield_tdm_per_ha"}.issubset(work.columns):
+            work[value_col] = pd.to_numeric(work["activity_tdm"], errors="coerce") / pd.to_numeric(
+                work["yield_tdm_per_ha"], errors="coerce"
+            ).replace(0.0, np.nan)
+        else:
+            raise ValueError("Dedicated energy crops require full resource-feasible area or biomass/yield; expansion alone is insufficient")
     work[value_col] = pd.to_numeric(work.get(value_col), errors="coerce")
+    if work[value_col].isna().any() or (work[value_col] < 0).any():
+        raise ValueError("Missing or negative full dedicated energy-crop area")
     work = work.dropna(subset=["year", value_col])
     work = work[work[value_col].gt(0.0)]
     if work.empty:

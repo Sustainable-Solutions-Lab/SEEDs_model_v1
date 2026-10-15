@@ -1396,6 +1396,12 @@ class LivestockEmissionsCalculator:
             self._get_yield_multiplier(m49_code, item_emis, year)
             for m49_code, item_emis in grouped[['M49_Country_Code', 'Item_Emis']].itertuples(index=False, name=None)
         ]
+        if year >= 2020:
+            reference = self.scenario_params.get('animal_yield_reference', {})
+            for row_index, row in grouped.iterrows():
+                reference_value = reference.get((_normalize_m49_for_comparison(row.M49_Country_Code), str(row.Item_Emis)))
+                if reference_value is not None:
+                    grouped.at[row_index, 'yield_t_per_head'] = float(reference_value)
         grouped['yield_t_per_head'] = pd.to_numeric(grouped['yield_t_per_head'], errors='coerce') * pd.to_numeric(grouped['yield_multiplier'], errors='coerce').fillna(1.0)
         grouped = grouped[grouped['yield_t_per_head'] > 0].copy()
         if grouped.empty:
@@ -1489,6 +1495,12 @@ class LivestockEmissionsCalculator:
             self._get_yield_multiplier(m49_code, item_emis, year)
             for m49_code, item_emis in grouped[['M49_Country_Code', 'Item_Emis']].itertuples(index=False, name=None)
         ]
+        if year >= 2020:
+            reference = self.scenario_params.get('animal_yield_reference', {})
+            for row_index, row in grouped.iterrows():
+                reference_value = reference.get((_normalize_m49_for_comparison(row.M49_Country_Code), str(row.Item_Emis)))
+                if reference_value is not None:
+                    grouped.at[row_index, 'carcass_weight_t'] = float(reference_value)
         grouped['carcass_weight_t'] = pd.to_numeric(grouped['carcass_weight_t'], errors='coerce') * pd.to_numeric(grouped['yield_multiplier'], errors='coerce').fillna(1.0)
         missing_yield = (grouped['carcass_weight_t'].fillna(0.0) <= 0).sum()
         if missing_yield:
@@ -1834,6 +1846,17 @@ class LivestockEmissionsCalculator:
         work['ratio_val'] = pd.to_numeric(work['ratio_val'], errors='coerce').fillna(1.0)
         work.loc[work['ratio_val'] <= 0, 'ratio_val'] = 1.0
 
+        # B04 reference ratios preserve observed 2020 production and stock.
+        # Ratios are animal flows / standing herd and may legitimately exceed 1.
+        reference = (self.scenario_params or {}).get('stock_ratio_reference', {})
+        if reference and year >= 2020:
+            override = pd.Series([reference.get((str(c),str(j)), np.nan)
+                                  for c,j in zip(work.M49_Country_Code,work.Item_Emis)], index=work.index)
+            identified = override.notna()
+            if ((override[identified] <= 0) | ~np.isfinite(override[identified])).any():
+                raise ValueError('Invalid B04 reference stock conversion ratio')
+            work.loc[identified,'ratio_val'] = override[identified]
+
         milk = work['milk_animals'].to_numpy(dtype=float)
         slaughtered = work['slaughtered'].to_numpy(dtype=float)
         laying = work['laying'].to_numpy(dtype=float)
@@ -1850,6 +1873,18 @@ class LivestockEmissionsCalculator:
         result_df['year'] = year
         result_df['stock'] = work.loc[work['stock'] > 0, 'stock'].to_numpy()
         result_df['animal_type'] = work.loc[work['stock'] > 0, 'animal_type'].to_numpy()
+        # B04: independent background herds enter both feed and emissions once.
+        if year >= 2020:
+            background = self.scenario_params.get('background_stock_reference', {})
+            if background:
+                extra = pd.DataFrame([dict(M49_Country_Code=_normalize_m49_for_comparison(c),
+                    Item=j,Item_Emis=j,year=year,stock=float(heads),animal_type='background')
+                    for (c,j),heads in background.items() if float(heads)>0])
+                if not extra.empty:
+                    bg_keys=set(zip(extra.M49_Country_Code,extra.Item_Emis))
+                    keep=[(c,j) not in bg_keys for c,j in zip(result_df.M49_Country_Code,result_df.Item_Emis)]
+                    result_df=pd.concat([result_df.loc[keep],extra],ignore_index=True)
+
         logger.info(f"输出stock_df: {len(result_df)} 行")
         if not result_df.empty:
             logger.info(f"  奶类: {len(result_df[result_df['animal_type']=='milk'])} 行")
@@ -3247,7 +3282,10 @@ def _get_cached_livestock_calculator(
         str(Path(hist_emissions_path).resolve()),
         str(Path(hist_manure_stock_path).resolve()),
         str(Path(dict_v3_path).resolve()),
-        id(yield_mult) if isinstance(yield_mult, dict) else 0,
+        tuple(sorted((repr(k),float(v)) for k,v in (yield_mult or {}).items())),
+        tuple(sorted((repr(k),float(v)) for k,v in (scenario_params or {}).get('stock_ratio_reference', {}).items())),
+        tuple(sorted((repr(k),float(v)) for k,v in (scenario_params or {}).get('animal_yield_reference', {}).items())),
+        tuple(sorted((repr(k),float(v)) for k,v in (scenario_params or {}).get('background_stock_reference', {}).items())),
     )
     calculator = _CALCULATOR_CACHE.get(key)
     if calculator is None:
